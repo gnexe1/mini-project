@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>EV Bus 2.5D Simulation — MILP Swap Assignment</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root { --bg:#0c1116; --panel:#0f1720; --muted:#9aa4b2; --accent:#00d1b2; --danger:#ff6b6b; }
+  body { margin:0; font-family:Inter,Segoe UI,Arial; background:var(--bg); color:#e6eef6; display:flex; height:100vh; }
+  #left{ width:72%; padding:12px; box-sizing:border-box; }
+  #right{ width:28%; padding:12px; box-sizing:border-box; border-left:1px solid rgba(255,255,255,0.03); background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent); }
+  canvas{ width:100%; height: calc(100vh - 150px); display:block; border-radius:8px; background:linear-gradient(180deg,#122029,#071018); }
+  .controls{ display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  button{ background:#0f1720; color:#e6eef6; border:1px solid rgba(255,255,255,0.04); padding:8px 10px; border-radius:6px; cursor:pointer; }
+  .btn-primary{ background:var(--accent); color:#042018; font-weight:600; }
+  .panel{ background:var(--panel); padding:10px; border-radius:8px; margin-bottom:12px; box-shadow:0 6px 18px rgba(0,0,0,0.6); }
+  .small{ font-size:12px; color:var(--muted) }
+  #log{ height:200px; overflow:auto; background:#081018; padding:8px; border-radius:6px; font-family:monospace; font-size:12px; color:#bcd; }
+  .badge{ background:#0b1220; color:var(--muted); padding:3px 6px; border-radius:6px; font-size:12px; }
+  label{ font-size:12px; color:var(--muted); }
+  input[type=range]{ width:160px; }
+  .stat-row{ display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed rgba(255,255,255,0.02); }
+  .flex-col{ display:flex; flex-direction:column; gap:8px; }
+</style>
+<!-- javascript-lp-solver (for MILP assignment) -->
+<script src="https://cdn.jsdelivr.net/npm/javascript-lp-solver/prod/solver.js"></script>
+</head>
+<body>
+<div id="left">
+  <div class="controls">
+    <button id="startBtn" class="btn-primary">Start</button>
+    <button id="pauseBtn">Pause</button>
+    <button id="resetBtn">Reset</button>
+    <label class="small" style="margin-left:8px">Speed</label>
+    <input id="speed" type="range" min="0.2" max="6" step="0.1" value="1">
+    <span id="speedLabel" class="badge">1×</span>
+    <label class="small" style="margin-left:8px">Randomness</label>
+    <input id="rnd" type="checkbox" checked>
+    <button id="addBus">+ Add Bus</button>
+    <div style="margin-left:auto" class="small-muted">Sim min: <span id="simClock">0.0</span></div>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <div style="display:flex; gap:8px; margin-top:8px;">
+    <div class="panel" style="flex:1">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>Dashboard</strong><div class="small">Fleet metrics (live)</div></div>
+        <div class="small-muted">Buses: <span id="busCount">0</span></div>
+      </div>
+      <div id="dashboardRows" style="margin-top:8px; max-height:140px; overflow:auto"></div>
+      <div style="margin-top:8px; display:flex; gap:8px;">
+        <button id="exportCSV">Download CSV</button>
+        <button id="exportJSON">Download JSON</button>
+      </div>
+    </div>
+
+    <div class="panel" style="width:360px;">
+      <div><strong>Event Log</strong></div>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<div id="right">
+  <div class="panel">
+    <div><strong>Legend & Controls</strong></div>
+    <div class="small-muted" style="margin-top:6px">
+      <div>Green/blue squares = depots ●, Circles = route stops, Green circles = swap stations</div>
+      <div style="margin-top:6px">Use <strong>Speed</strong> slider to change simulation speed.</div>
+      <div style="margin-top:6px">When SOC &lt; threshold, MILP assigns buses to stations (min total detour) and buses detour to assigned station.</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div><strong>Settings</strong></div>
+    <div style="margin-top:8px" class="small">Swap duration (sim minutes)</div>
+    <input id="swapDuration" type="number" value="10" min="1" style="width:80px">
+    <div style="margin-top:8px" class="small">Swap bay capacity</div>
+    <input id="bayCapacity" type="number" value="2" min="1" style="width:80px">
+    <div style="margin-top:8px" class="small">Swap threshold (%)</div>
+    <input id="swapThreshold" type="number" value="30" min="5" max="90" style="width:80px"> %
+    <div style="margin-top:8px">
+      <button id="applySettings">Apply</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div><strong>Export Tips</strong></div>
+    <div class="small-muted" style="margin-top:6px">
+      After the run press <strong>Download CSV</strong> or <strong>Download JSON</strong> to export per-bus metrics for slides.
+    </div>
+  </div>
+</div>
+
+<script>
+/* Full simulation with MILP-based assignment to swap stations
+   - Save this file and keep bus.png in same folder (32x32 transparent recommended)
+   - Open with Live Server or a browser
+*/
+
+// Canvas setup & bus sprite
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const busImg = new Image(); busImg.src = 'bus.png'; // place bus.png near the html file
+
+function resizeCanvas(){ canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight; }
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// Simulation globals
+let running=false, lastRealTs=0, simTime=0, simSpeed=1, randomness=true;
+let swapDuration = parseFloat(document.getElementById('swapDuration').value);
+let swapThresholdPct = parseFloat(document.getElementById('swapThreshold').value);
+
+// Map nodes (x,y)
+const nodes = {
+  DepotA: {x:160, y:600}, DepotB: {x:1040, y:600},
+  R1S: {x:360, y:380}, R1E: {x:520, y:260},
+  R2S: {x:760, y:380}, R2E: {x:920, y:260},
+  R3S: {x:600, y:480}, R3E: {x:440, y:200},
+  Swap1: {x:420, y:520}, Swap2: {x:780, y:520}
+};
+
+// Routes (4 colored)
+const routes = [
+  ['DepotA','R1S','R1E','DepotA'],
+  ['DepotB','R2S','R2E','DepotB'],
+  ['DepotA','R1E','R2S','DepotB'],
+  ['DepotB','R2E','R1S','DepotA']
+];
+const routeColors = ['#4ade80','#60a5fa','#facc15','#f472b6'];
+
+// Swap station structures
+let swapStations = {
+  Swap1: {node:'Swap1', bays: 2, queue: [], busy: []},
+  Swap2: {node:'Swap2', bays: 2, queue: [], busy: []}
+};
+
+// Vehicle & model params
+const BUS_FULL_SOC = 350.0;
+const consumptionPerPixel = 0.12;
+const BUS_BASE_SPEED = 75;
+
+// runtime
+let buses = [], nextBusId = 1, EVENTS = [];
+
+// utilities
+function formatSimTime(t){ return t.toFixed(1); }
+function appendLog(text){ const logEl=document.getElementById('log'); const d=document.createElement('div'); d.textContent=text; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; EVENTS.push({time:simTime, text}); }
+function euclid(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+function distanceFromPosToNode(posKey, nodeKey){ return euclid(nodes[posKey], nodes[nodeKey]); }
+function distancePosToNode(pos, nodeKey){ return Math.hypot(pos.x - nodes[nodeKey].x, pos.y - nodes[nodeKey].y); }
+function nearestSwapKeyFromPos(pos){
+  let best=null, bd=1e9;
+  for(const k in swapStations){
+    const d = distancePosToNode(pos, swapStations[k].node);
+    if(d<bd){ bd=d; best=swapStations[k].node; }
+  }
+  return best;
+}
+
+// --- MILP assignment function ---
+// Accepts array of Bus objects (to assign) and returns mapping bus.name -> stationNode
+function assignStationsMILP(busesToAssign){
+  // Build a simple assignment model: minimize sum(distance) subject to each bus assigned exactly once and station capacity <= bays
+  try {
+    const model = { optimize: "cost", opType: "min", constraints: {}, variables: {} };
+
+    // station constraints (max capacity)
+    for(const sk in swapStations){
+      const stnode = swapStations[sk].node;
+      model.constraints[stnode] = { "max": swapStations[sk].bays };
+    }
+
+    // bus constraints (each bus exactly one)
+    busesToAssign.forEach(bus=>{
+      model.constraints[bus.name] = { "equal": 1 };
+      // variable for each station
+      let idx = 0;
+      for(const sk in swapStations){
+        const stnode = swapStations[sk].node;
+        // variable name
+        const varName = `${bus.name}_st${idx}`;
+        const dist = distancePosToNode(bus.pos, stnode);
+        // cost is distance (minimize detour)
+        model.variables[varName] = { cost: dist };
+        // link var to bus constraint
+        model.variables[varName][bus.name] = 1;
+        // link var to station capacity
+        model.variables[varName][stnode] = 1;
+        idx++;
+      }
+    });
+
+    const results = solver.Solve(model);
+    // parse results: variables with value 1 indicate assignment
+    const assignment = {};
+    Object.keys(results).forEach(key=>{
+      if(key.endsWith('_st0') || key.endsWith('_st1') || key.includes('_st')){
+        if(results[key] === 1){
+          const parts = key.split('_st');
+          const busName = parts[0];
+          const stIdx = parseInt(parts[1], 10);
+          // map index to station node (consistent order)
+          const stKeys = Object.keys(swapStations);
+          const node = swapStations[stKeys[stIdx]].node;
+          assignment[busName] = node;
+        }
+      }
+    });
+    return assignment;
+  } catch(e) {
+    console.warn("MILP failed, falling back to greedy", e);
+    // fallback greedy: nearest
+    const out = {};
+    busesToAssign.forEach(b=>{
+      out[b.name] = nearestSwapKeyFromPos(b.pos);
+    });
+    return out;
+  }
+}
+
+// --- Bus class ---
+class Bus {
+  constructor(id, routeIndex=0, startDelay=0){
+    this.id = id; this.name = 'Bus'+id; this.routeIndex = routeIndex; this.route = routes[routeIndex].slice();
+    this.pos = {...nodes[this.route[0]]}; this.targetIndex = 1;
+    this.speed = BUS_BASE_SPEED + (Math.random()*40-20);
+    this.socMax = BUS_FULL_SOC; this.soc = this.socMax; this.distance = 0; this.energyUsed = 0;
+    this.swaps = 0; this.trips = 0; this.startDelay = startDelay; this.started = false; this.done = false; this.awaiting = false;
+    this.assignedStation = null; // station assigned by MILP
+    this.divertTarget = null; // current divert station node key
+    this.events = [];
+  }
+
+  log(msg){ const line = `${formatSimTime(simTime)}m | ${this.name} | ${msg}`; appendLog(line); this.events.push({t:simTime, msg}); }
+
+  step(deltaSimMin){
+    if(this.done) return;
+    if(!this.started){
+      if(simTime >= this.startDelay){ this.started = true; this.log('START route '+this.routeIndex); }
+      else return;
+    }
+    if(this.awaiting) return; // waiting for swap or in bay
+
+    // decide current target (divert target takes precedence)
+    let targetKey = this.divertTarget || this.route[this.targetIndex];
+    const targetNode = nodes[targetKey];
+    const dx = targetNode.x - this.pos.x, dy = targetNode.y - this.pos.y;
+    const d = Math.hypot(dx, dy);
+    if(d < 1){ this.onArrive(targetKey); return; }
+
+    const factor = randomness ? (0.9 + Math.random()*0.2) : 1.0;
+    const pixToMove = Math.min(d, this.speed * deltaSimMin * factor);
+    const ux = dx/d, uy = dy/d;
+    this.pos.x += ux * pixToMove; this.pos.y += uy * pixToMove;
+    this.distance += pixToMove;
+    const energy = pixToMove * consumptionPerPixel * (randomness ? (0.98 + Math.random()*0.04) : 1.0);
+    this.soc -= energy; this.energyUsed += energy;
+
+    // decide whether to request a swap assignment (collect candidate buses and call MILP)
+    const pct = this.soc / this.socMax * 100;
+    if(pct <= swapThresholdPct && !this.divertTarget && !this.assignedStation){
+      // mark for assignment (will be processed by scheduler outside)
+      scheduler.markForAssignment(this);
+    }
+  }
+
+  onArrive(nodeKey){
+    this.log('ARRIVED '+nodeKey+' SOC='+this.soc.toFixed(1));
+
+    // If arrived at a swap station node (by name)
+    for(const sk in swapStations){
+      if(swapStations[sk].node === nodeKey){
+        const st = swapStations[sk];
+        st.queue.push(this);
+        this.awaiting = true;
+        this.log('Queued at '+nodeKey+' (qlen '+st.queue.length+')');
+        // clear assigned/divert (we are at the station)
+        this.assignedStation = null;
+        this.divertTarget = null;
+        processSwapQueue(nodeKey);
+        return;
+      }
+    }
+
+    // Not a swap station: advance route
+    if(this.targetIndex < this.route.length - 1){
+      this.targetIndex++;
+    } else {
+      this.done = true;
+      this.trips++;
+      this.log('FINISHED route');
+    }
+  }
+
+  draw(ctx){
+    ctx.save();
+    const x = this.pos.x, y = this.pos.y, depth = 1 - (y/900)*0.12;
+    ctx.translate(x, y);
+    ctx.scale(depth, depth);
+
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath(); ctx.ellipse(0,9,14,6,0,0,Math.PI*2); ctx.fill();
+
+    // sprite
+    if(busImg.complete){
+      ctx.drawImage(busImg, -16, -16, 32, 32);
+    } else {
+      ctx.fillStyle = '#2b8cff';
+      ctx.fillRect(-12,-6,24,12);
+    }
+
+    // name
+    ctx.fillStyle = '#fff';
+    ctx.font = '10px monospace';
+    ctx.fillText(this.name, -14, -20);
+
+    // SOC bar
+    const pct = Math.max(0, Math.min(1, this.soc / this.socMax));
+    const barW = 48, barH = 7, bw = Math.round(barW * pct);
+    ctx.fillStyle = '#111827'; ctx.fillRect(-barW/2, -28, barW, barH);
+    ctx.fillStyle = pct>0.6 ? '#2ecc71' : (pct>0.3 ? '#f1c40f' : '#ff6b6b'); ctx.fillRect(-barW/2, -28, bw, barH);
+    ctx.fillStyle = 'white'; ctx.font = '10px monospace'; ctx.fillText(Math.round(pct*100)+'%', -10, -32);
+
+    ctx.restore();
+  }
+}
+
+// Swap queue processing & completion
+function processSwapQueue(stationNodeKey){
+  const stKey = Object.keys(swapStations).find(k => swapStations[k].node === stationNodeKey);
+  const st = swapStations[stKey];
+  while(st.busy.length < st.bays && st.queue.length > 0){
+    const bus = st.queue.shift();
+    const finish = simTime + swapDuration * (randomness ? (0.9 + Math.random()*0.2) : 1.0);
+    st.busy.push({bus, finish});
+    bus.log('SWAP_START at '+stationNodeKey+' finish@'+formatSimTime(finish));
+  }
+}
+function finishSwaps(){
+  for(const k in swapStations){
+    const st = swapStations[k];
+    for(let i = st.busy.length-1; i>=0; --i){
+      if(simTime >= st.busy[i].finish){
+        const item = st.busy[i];
+        const bus = item.bus;
+        bus.soc = bus.socMax;
+        bus.swaps++;
+        bus.awaiting = false;
+        bus.log('SWAP_COMPLETE at '+st.node+' SOC='+bus.soc.toFixed(1));
+        st.busy.splice(i,1);
+      }
+    }
+    if(st.busy.length < st.bays && st.queue.length > 0) processSwapQueue(st.node);
+  }
+}
+
+// Draw helpers
+function drawRoad(keys,color){
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 22;
+  ctx.strokeStyle = color+'44';
+  ctx.beginPath(); ctx.moveTo(nodes[keys[0]].x, nodes[keys[0]].y);
+  for(let i=1;i<keys.length;i++) ctx.lineTo(nodes[keys[i]].x, nodes[keys[i]].y);
+  ctx.stroke();
+
+  ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.setLineDash([12,12]);
+  ctx.beginPath(); ctx.moveTo(nodes[keys[0]].x, nodes[keys[0]].y);
+  for(let i=1;i<keys.length;i++) ctx.lineTo(nodes[keys[i]].x, nodes[keys[i]].y);
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawScene(){
+  ctx.fillStyle = '#071018'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  routes.forEach((r,i)=> drawRoad(r, routeColors[i%routeColors.length]));
+  for(const key in nodes){
+    const n = nodes[key];
+    if(key.startsWith('Depot')){ ctx.fillStyle = '#00d1b2'; ctx.fillRect(n.x-12,n.y-12,24,24); ctx.fillStyle='black'; ctx.font='12px sans-serif'; ctx.fillText(key.replace('Depot','D'), n.x-10, n.y+5);}
+    else if(key.startsWith('R')){ ctx.fillStyle = '#98b4c6'; ctx.beginPath(); ctx.arc(n.x, n.y, 8, 0, Math.PI*2); ctx.fill();}
+    else if(key.startsWith('Swap')){ ctx.fillStyle = '#7bd389'; ctx.beginPath(); ctx.arc(n.x, n.y, 14, 0, Math.PI*2); ctx.fill(); ctx.fillStyle='black'; ctx.font='12px sans-serif'; ctx.fillText('S', n.x-4, n.y+5);}
+  }
+
+  // visualize swap station queues/busy
+  for(const key in swapStations){
+    const s = swapStations[key]; const n = nodes[s.node];
+    s.busy.forEach((item,i)=>{ ctx.fillStyle='#ff6b6b'; ctx.beginPath(); ctx.arc(n.x-18+i*12, n.y+24, 6, 0, Math.PI*2); ctx.fill(); });
+    s.queue.forEach((bus,i)=>{ ctx.fillStyle='#60a5fa'; ctx.beginPath(); ctx.arc(n.x-18+i*12, n.y+36, 6, 0, Math.PI*2); ctx.fill(); });
+    ctx.fillStyle='white'; ctx.font='12px monospace'; ctx.fillText(`bays:${s.bays} q:${s.queue.length} busy:${s.busy.length}`, n.x-36, n.y+34);
+  }
+
+  // draw buses
+  for(const bus of buses) bus.draw(ctx);
+}
+
+// Dashboard
+function updateDashboard(){
+  const dash = document.getElementById('dashboardRows'); dash.innerHTML = '';
+  document.getElementById('busCount').textContent = buses.length;
+  buses.forEach(bus=>{
+    const row = document.createElement('div'); row.className='stat-row';
+    row.innerHTML = `<div style="font-weight:600">${bus.name}</div><div style="text-align:right"><div class="small">${Math.round(bus.soc)}/${bus.socMax} kWh</div><div class="small">${Math.round(bus.energyUsed)} kWh used</div></div>`;
+    dash.appendChild(row);
+  });
+}
+
+// Scheduler: collects buses that need assignment and runs MILP periodically
+const scheduler = {
+  pendingSet: new Set(),
+  markForAssignment(bus){ this.pendingSet.add(bus); },
+  runAssignment(){
+    if(this.pendingSet.size === 0) return;
+    // create array
+    const list = Array.from(this.pendingSet).filter(b => !b.assignedStation && !b.awaiting && !b.divertTarget);
+    if(list.length === 0) { this.pendingSet.clear(); return; }
+    // call MILP assignment
+    const assignment = assignStationsMILP(list);
+    // apply assignments
+    list.forEach(b=>{
+      const node = assignment[b.name] || nearestSwapKeyFromPos(b.pos);
+      if(node){
+        b.assignedStation = node;
+        b.divertTarget = node;
+        b.log('ASSIGNED (MILP) -> '+node);
+      }
+      this.pendingSet.delete(b);
+    });
+  }
+};
+
+// MILP assignment function (re-used)
+function assignStationsMILP(busesToAssign){
+  try {
+    // if no buses, return {}
+    if(!busesToAssign || busesToAssign.length===0) return {};
+    const model = { optimize: "cost", opType: "min", constraints: {}, variables: {} };
+
+    // station constraints
+    const stKeys = Object.keys(swapStations);
+    stKeys.forEach(sk => { const node = swapStations[sk].node; model.constraints[node] = { "max": swapStations[sk].bays }; });
+
+    // bus constraints + variables
+    busesToAssign.forEach(bus=>{
+      model.constraints[bus.name] = { "equal": 1 };
+      stKeys.forEach((sk, j) => {
+        const node = swapStations[sk].node;
+        const varName = `${bus.name}_st${j}`;
+        // cost = Euclidean distance (pixel) -> smaller is better
+        const cost = distancePosToNode(bus.pos, node);
+        model.variables[varName] = { cost };
+        model.variables[varName][bus.name] = 1;
+        model.variables[varName][node] = 1;
+      });
+    });
+
+    const results = solver.Solve(model);
+    const out = {};
+    // parse results: variable keys with value 1
+    Object.keys(results).forEach(k=>{
+      if(k.includes('_st')){
+        const val = results[k];
+        if(val === 1){
+          const parts = k.split('_st');
+          const busName = parts[0];
+          const idx = parseInt(parts[1],10);
+          const sk = stKeys[idx];
+          out[busName] = swapStations[sk].node;
+        }
+      }
+    });
+    // If solver gave fractional results, fallback to greedy nearest for those missing
+    busesToAssign.forEach(b=>{
+      if(!out[b.name]) out[b.name] = nearestSwapKeyFromPos(b.pos);
+    });
+    return out;
+  } catch(e){
+    console.warn('MILP error', e);
+    const fallback = {};
+    busesToAssign.forEach(b => fallback[b.name] = nearestSwapKeyFromPos(b.pos));
+    return fallback;
+  }
+}
+
+// Simulation loop
+function stepSim(deltaSim){
+  // run scheduler every tick
+  scheduler.runAssignment();
+
+  for(const b of buses) b.step(deltaSim);
+  finishSwaps();
+  simTime += deltaSim;
+  document.getElementById('simClock').textContent = formatSimTime(simTime);
+  drawScene();
+  updateDashboard();
+}
+
+function loop(ts){
+  if(!lastRealTs) lastRealTs = ts;
+  const deltaMs = ts - lastRealTs;
+  lastRealTs = ts;
+  if(running) stepSim(deltaMs/1000*simSpeed);
+  requestAnimationFrame(loop);
+}
+
+// spawn/init
+function spawnBus(routeIndex=0, delay=0){
+  const b = new Bus(nextBusId++, routeIndex, delay);
+  buses.push(b);
+  appendLog(`${b.name} spawned route ${routeIndex} delay ${delay}`);
+  updateDashboard();
+}
+
+function initFleet(){
+  buses = []; nextBusId = 1; EVENTS = []; document.getElementById('log').innerHTML='';
+  // reset stations
+  for(const k in swapStations){ swapStations[k].queue = []; swapStations[k].busy = []; }
+  // spawn 3 buses per route (example)
+  for(let i=0;i<routes.length;i++){ spawnBus(i, 0); spawnBus(i, 30); spawnBus(i, 60); }
+  simTime = 0; lastRealTs = 0; appendLog('Fleet initialized');
+  drawScene(); updateDashboard();
+}
+
+// UI wiring
+document.getElementById('startBtn').onclick = ()=> running = true;
+document.getElementById('pauseBtn').onclick = ()=> running = false;
+document.getElementById('resetBtn').onclick = ()=> { running = false; initFleet(); };
+document.getElementById('addBus').onclick = ()=> spawnBus(Math.floor(Math.random()*routes.length), simTime);
+document.getElementById('speed').oninput = e => { simSpeed = parseFloat(e.target.value); document.getElementById('speedLabel').textContent = simSpeed.toFixed(1)+'×'; };
+document.getElementById('rnd').onchange = e => randomness = e.target.checked;
+document.getElementById('applySettings').onclick = ()=>{
+  swapDuration = Math.max(1, parseFloat(document.getElementById('swapDuration').value) || swapDuration);
+  swapThresholdPct = Math.max(5, Math.min(90, parseInt(document.getElementById('swapThreshold').value) || swapThresholdPct));
+  const bays = Math.max(1, parseInt(document.getElementById('bayCapacity').value) || 1);
+  for(const k in swapStations) swapStations[k].bays = bays;
+  appendLog(`Settings applied: swapDur=${swapDuration}, bays=${bays}, threshold=${swapThresholdPct}%`);
+};
+document.getElementById('exportCSV').onclick = ()=> {
+  let csv = 'BusID,RouteIndex,SOC,Distance,EnergyUsed,Swaps,Trips\n';
+  buses.forEach(b => { csv += `${b.name},${b.routeIndex},${b.soc.toFixed(1)},${b.distance.toFixed(1)},${b.energyUsed.toFixed(1)},${b.swaps},${b.trips}\n`; });
+  const blob = new Blob([csv], {type:'text/csv'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='ev_bus_metrics.csv'; a.click(); URL.revokeObjectURL(url);
+};
+document.getElementById('exportJSON').onclick = ()=> {
+  const out = buses.map(b => ({BusID:b.name,RouteIndex:b.routeIndex,SOC:b.soc,Distance:b.distance,EnergyUsed:b.energyUsed,Swaps:b.swaps,Trips:b.trips}));
+  const blob = new Blob([JSON.stringify(out,null,2)], {type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='ev_bus_metrics.json'; a.click(); URL.revokeObjectURL(url);
+};
+
+// start
+window.onload = ()=> { initFleet(); requestAnimationFrame(loop); };
+
+</script>
+</body>
+</html>
